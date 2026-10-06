@@ -43,6 +43,15 @@ object PatchStore {
         ) {
             "${PATCH_AC_NEXUS_NO_APPSW_72.name} conflicts with ${PATCH_AC_NEXUS_NO_APPSW_90.name}; select only one."
         }
+        require(
+            PATCH_REPLACE_OPENXR_DISPATCHER.name !in selectedNames ||
+                PATCH_COPY_LIBRARIES.name !in selectedNames ||
+                requestedNames.indexOf(PATCH_COPY_LIBRARIES.name) <
+                requestedNames.indexOf(PATCH_REPLACE_OPENXR_DISPATCHER.name)
+        ) {
+            "${PATCH_REPLACE_OPENXR_DISPATCHER.name} must come after ${PATCH_COPY_LIBRARIES.name}, " +
+                "which would otherwise overwrite the supplied dispatcher."
+        }
         return requestedNames.map(PATCHES::getValue)
     }
 
@@ -72,5 +81,6 @@ object PatchStore {
         register(PATCH_DISABLE_META_XR_AUDIO_TELEMETRY)
         register(PATCH_AC_NEXUS_NO_APPSW_72)
         register(PATCH_AC_NEXUS_NO_APPSW_90)
+        register(PATCH_REPLACE_OPENXR_DISPATCHER)
     }
 }

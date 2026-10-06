@@ -58,6 +58,25 @@ dispatcher already handles by skipping telemetry; audio is unaffected. It
 matches `libMetaXRAudioUnity.so` as shipped in North Star 1.0.1 and leaves any
 other build unchanged.
 
+## Custom OpenXR dispatcher
+
+`patch_replace_openxr_dispatcher=<path>` is optional and not recommended by
+default. It replaces the `libopenxr_loader.so` dispatcher that
+`patch_copy_libraries` packages from the downloaded library bundle with one
+you supply, such as an open-source or locally built dispatcher. `<path>` is
+either a directory containing `<abi>/libopenxr_loader.so` for every ABI the APK
+ships, or a single `.so` file for an APK whose only ABI is `arm64-v8a`. Vendor
+loaders and `libopenxr_loader_generic.so` are left unchanged. The patch fails
+without replacing anything when the path or a required ABI file is missing.
+Add it with `--extra-patches` so it runs after `patch_copy_libraries`; the path
+cannot contain `,` or `;`.
+
+```bash
+java -jar <cli.jar> patch \
+  --input=/path/to/application.apk \
+  --extra-patches=patch_replace_openxr_dispatcher=/path/to/prebuilt
+```
+
 ## Experimental direct VrApi compatibility
 
 Experimental builds add the non-recommended `Replace VrApi with experimental
