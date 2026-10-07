@@ -69,12 +69,12 @@ def main():
     if not compiler.is_file():
         raise SystemExit(f"NDK compiler is missing: {compiler}")
     files = [source / name for name in ("runtime.cpp", "graphics.cpp", "input.cpp")]
-    flags = ["--target=aarch64-linux-android29", f"--sysroot={toolchain / 'sysroot'}", "-std=c++17", "-O2", "-g", "-fPIC", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-Wall", "-Wextra", "-Werror=return-type", "-DXR_NO_PROTOTYPES", "-DXR_USE_PLATFORM_ANDROID", "-DXR_USE_GRAPHICS_API_VULKAN", "-DXR_USE_TIMESPEC", f"-I{build / 'include'}"]
+    flags = ["--target=aarch64-linux-android29", f"--sysroot={toolchain / 'sysroot'}", "-std=c++17", "-O2", "-g", "-fPIC", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-Wall", "-Wextra", "-Werror=return-type", "-DXR_NO_PROTOTYPES", "-DXR_USE_PLATFORM_ANDROID", "-DXR_USE_GRAPHICS_API_VULKAN", "-DXR_USE_GRAPHICS_API_OPENGL_ES", "-DXR_USE_TIMESPEC", f"-I{build / 'include'}"]
     # Compile database is useful for native diagnostics, but is build output, not source.
     database = [{"directory": str(source), "file": str(file), "arguments": [str(compiler), *flags, "-c", str(file)]} for file in files]
     (build / "compile_commands.json").write_text(json.dumps(database, indent=2))
     library = build / "libvrapi.so"
-    subprocess.run([str(compiler), *flags, "-shared", "-static-libstdc++", *(str(file) for file in files), "-Wl,--no-undefined", "-Wl,-z,max-page-size=16384", f"-Wl,--version-script={source / 'exports.map'}", "-llog", "-landroid", "-lvulkan", "-ldl", "-o", str(library)], check=True)
+    subprocess.run([str(compiler), *flags, "-shared", "-static-libstdc++", *(str(file) for file in files), "-Wl,--no-undefined", "-Wl,-z,max-page-size=16384", f"-Wl,--version-script={source / 'exports.map'}", "-llog", "-landroid", "-lvulkan", "-lEGL", "-lGLESv3", "-ldl", "-o", str(library)], check=True)
     resource_root = args.output.resolve()
     destination = resource_root / "vrapi/arm64-v8a/libvrapi.bin"
     destination.parent.mkdir(parents=True, exist_ok=True)

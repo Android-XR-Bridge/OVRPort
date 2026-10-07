@@ -176,9 +176,44 @@ bool ensureGraphicsQueue(VkQueue preferredQueue) {
     }
     return true;
 }
+static bool createGlesSession() {
+    auto& s = runtime();
+    if (!s.getGlesRequirements) { OVP_ERROR("Runtime lacks XR_KHR_opengl_es_enable"); return false; }
+    XrGraphicsRequirementsOpenGLESKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR};
+    if (!xrOk(s.getGlesRequirements(s.instance, s.system, &requirements), "xrGetOpenGLESGraphicsRequirementsKHR")) return false;
+    XrGraphicsBindingOpenGLESAndroidKHR binding{XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
+    binding.display = s.eglDisplay;
+    binding.config = s.eglConfig;
+    binding.context = s.eglContext;
+    XrSessionCreateInfo create{XR_TYPE_SESSION_CREATE_INFO};
+    create.next = &binding;
+    create.systemId = s.system;
+    if (!xrOk(s.xr.xrCreateSession(s.instance, &create, &s.session), "xrCreateSession(GLES)")) return false;
+    OVP_LOG("Created OpenXR session with the application's GLES context");
+    return true;
+}
 bool ensureSession(VkQueue preferredQueue) {
     auto& s = runtime();
     if (s.session) return !preferredQueue || preferredQueue == s.queue;
+    if (s.gles) {
+        if (!s.instance || !createGlesSession()) return false;
+        const XrPosef identityPose{{0, 0, 0, 1}, {0, 0, 0}};
+        if (!referenceSpace(XR_REFERENCE_SPACE_TYPE_LOCAL, identityPose, s.localSpace) ||
+            !referenceSpace(XR_REFERENCE_SPACE_TYPE_VIEW, identityPose, s.viewSpace) ||
+            !referenceSpace(XR_REFERENCE_SPACE_TYPE_LOCAL, identityPose, s.appSpace)) {
+            destroySession();
+            return false;
+        }
+        XrReferenceSpaceCreateInfo stageInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        stageInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+        stageInfo.poseInReferenceSpace = identityPose;
+        s.xr.xrCreateReferenceSpace(s.session, &stageInfo, &s.stageSpace);
+        if (!input::initialize()) { destroySession(); return false; }
+        s.trackingTransform = {{0, 0, 0, 1}, {0, 0, 0}};
+        s.centerEyeTransform = s.trackingTransform;
+        s.initialRecenterPending = true;
+        return true;
+    }
     if (!s.instance || !s.vk.Device) return false;
     VkPhysicalDevice expected = VK_NULL_HANDLE;
     if (!xrOk(s.xr.xrGetVulkanGraphicsDeviceKHR(s.instance, s.system, s.vk.Instance, &expected), "xrGetVulkanGraphicsDeviceKHR") || expected != s.vk.PhysicalDevice) {
@@ -409,11 +444,14 @@ VRAPI double vrapi_GetTimeInSeconds() { return secondsNow(); }
 VRAPI int vrapi_Initialize(const ovrInitParms* parms) {
     LOCK_STATE;
     if (s.instance) return -3;
-    if (!parms || parms->Type != 1 || parms->GraphicsAPI != 0x40100 || !parms->Java.Vm || !parms->Java.Env || !parms->Java.ActivityObject) {
-        OVP_ERROR("Initialization requires Vulkan 1.x, arm64, and a valid Android activity");
+    // VRAPI_GRAPHICS_API_VULKAN_1 = 0x40100, OPENGL_ES_2 = 0x10200, OPENGL_ES_3 = 0x10300.
+    const bool glesApi = parms && (parms->GraphicsAPI == 0x10200 || parms->GraphicsAPI == 0x10300);
+    if (!parms || parms->Type != 1 || (parms->GraphicsAPI != 0x40100 && !glesApi) || !parms->Java.Vm || !parms->Java.Env || !parms->Java.ActivityObject) {
+        OVP_ERROR("Initialization requires Vulkan 1.x or OpenGL ES, arm64, and a valid Android activity");
         return -1;
     }
     s.vm = parms->Java.Vm;
+    s.gles = glesApi;
     s.activity = parms->Java.Env->NewGlobalRef(parms->Java.ActivityObject);
     if (!s.activity) { shutdown(); return -1; }
     s.loader = dlopen("libopenxr_loader.so", RTLD_NOW | RTLD_LOCAL);
@@ -435,10 +473,13 @@ VRAPI int vrapi_Initialize(const ovrInitParms* parms) {
     if (!xrOk(s.xr.xrEnumerateInstanceExtensionProperties(nullptr, count, &count, supported.data()), "enumerate extensions")) { shutdown(); return -4; }
     auto has = [&](const char* name) { return std::any_of(supported.begin(), supported.end(), [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; }); };
     std::vector<const char*> extensions;
-    for (const char* required : {XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME}) {
-        if (!has(required)) { OVP_ERROR("Required OpenXR extension missing: %s", required); shutdown(); return -4; }
-        extensions.push_back(required);
-    }
+    if (!has(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME)) { OVP_ERROR("Required OpenXR extension missing: %s", XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME); shutdown(); return -4; }
+    extensions.push_back(XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME);
+    s.vulkanExtension = has(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    if (s.vulkanExtension) extensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    s.glesExtension = has(XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME);
+    if (s.glesExtension) extensions.push_back(XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME);
+    if (!s.vulkanExtension) { OVP_ERROR("Required OpenXR extension missing: %s", XR_KHR_VULKAN_ENABLE_EXTENSION_NAME); shutdown(); return -4; }
     s.viewConfigurationFovExtension = has(XR_EPIC_VIEW_CONFIGURATION_FOV_EXTENSION_NAME);
     if (s.viewConfigurationFovExtension) extensions.push_back(XR_EPIC_VIEW_CONFIGURATION_FOV_EXTENSION_NAME);
     s.systemDisplayRefreshRateExtension = has(SystemDisplayRefreshRateExtension);
@@ -482,7 +523,9 @@ VRAPI int vrapi_Initialize(const ovrInitParms* parms) {
     if (s.threadExtension) load("xrSetAndroidApplicationThreadKHR", reinterpret_cast<PFN_xrVoidFunction*>(&s.setThread));
     if (s.systemDisplayRefreshRateExtension) load("xrGetSystemDisplayRefreshRateAXRB", reinterpret_cast<PFN_xrVoidFunction*>(&s.getSystemDisplayRefreshRate));
     if (s.displayRefreshRateExtension) load("xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&s.getDisplayRefreshRate));
-    OVP_LOG("Initialized Vulkan/OpenXR adapter, stereo=%ux%u", s.viewConfig[0].recommendedImageRectWidth, s.viewConfig[0].recommendedImageRectHeight);
+    if (s.displayRefreshRateExtension) load("xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&s.requestDisplayRefreshRate));
+    if (s.glesExtension) load("xrGetOpenGLESGraphicsRequirementsKHR", reinterpret_cast<PFN_xrVoidFunction*>(&s.getGlesRequirements));
+    OVP_LOG("Initialized Vulkan/GLES OpenXR adapter (gles=%d), stereo=%ux%u", s.glesExtension ? 1 : 0, s.viewConfig[0].recommendedImageRectWidth, s.viewConfig[0].recommendedImageRectHeight);
     return 0;
 }
 VRAPI void vrapi_Shutdown() { LOCK_STATE; shutdown(); }
@@ -518,9 +561,27 @@ VRAPI void vrapi_DestroySystemVulkan() {
 }
 VRAPI ovrMobile* vrapi_EnterVrMode(const ovrModeParms* parms) {
     LOCK_STATE;
-    if (!parms || !s.vk.Device || s.inVr) return nullptr;
-    const auto* vk = reinterpret_cast<const ovrModeParmsVulkan*>(parms);
-    if (!ensureSession(reinterpret_cast<VkQueue>(vk->SynchronizationQueue))) return nullptr;
+    if (!parms || s.inVr) return nullptr;
+    VkQueue queue = VK_NULL_HANDLE;
+    if (s.vk.Device) {
+        queue = reinterpret_cast<VkQueue>(reinterpret_cast<const ovrModeParmsVulkan*>(parms)->SynchronizationQueue);
+    } else {
+        // GLES application: ovrModeParms carries its EGLDisplay and context.
+        s.gles = true;
+        s.eglDisplay = reinterpret_cast<EGLDisplay>(parms->Display);
+        s.eglContext = reinterpret_cast<EGLContext>(parms->ShareContext);
+        if (s.eglDisplay == EGL_NO_DISPLAY) s.eglDisplay = eglGetCurrentDisplay();
+        if (s.eglContext == EGL_NO_CONTEXT) s.eglContext = eglGetCurrentContext();
+        EGLint configId = 0, count = 0;
+        eglQueryContext(s.eglDisplay, s.eglContext, EGL_CONFIG_ID, &configId);
+        const EGLint attributes[] = {EGL_CONFIG_ID, configId, EGL_NONE};
+        if (!eglChooseConfig(s.eglDisplay, attributes, &s.eglConfig, 1, &count) || count != 1) {
+            OVP_ERROR("EnterVrMode(GLES): could not resolve the context's EGLConfig");
+            return nullptr;
+        }
+        OVP_LOG("EnterVrMode(GLES): display=%p context=%p config id=%d", s.eglDisplay, s.eglContext, configId);
+    }
+    if (!ensureSession(queue)) return nullptr;
     // Runtime READY can arrive asynchronously. Wait only for a bounded lifecycle transition.
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!s.running) {
@@ -664,4 +725,42 @@ VRAPI ovrResult vrapi_SetClientColorDesc(ovrMobile* mobile, const ovrHmdColorDes
     if (!color) return InvalidParameter;
     if (!s.setColorSpace) return color->ColorSpace == 0 ? Success : Unsupported;
     return xrOk(s.setColorSpace(s.session, static_cast<XrColorSpaceFB>(color->ColorSpace)), "xrSetColorSpaceFB") ? Success : InvalidParameter;
+}
+
+VRAPI ovrResult vrapi_SetTrackingSpace(ovrMobile* mobile, int32_t space) {
+    // Tracking-space changes (eye/floor level) are handled by the app's own poses; accept and ignore. VrApi returns an
+    // ovrResult here: a void function left the caller reading whatever was in w0.
+    (void)mobile;
+    OVP_LOG("vrapi_SetTrackingSpace(%d) ignored", space);
+    return Success;
+}
+VRAPI bool vrapi_ShowSystemUI(const ovrJava* java, int32_t type) {
+    (void)java;
+    OVP_LOG("vrapi_ShowSystemUI(%d) unsupported", type);
+    return false;
+}
+
+// Functions some engines import even when they never rely on them (e.g. BlazeRush's libtargemapp.so): a missing one
+// stops the game from loading at all ("cannot locate symbol").
+VRAPI ovrResult vrapi_PollEvent(ovrEventHeader* event) {
+    // No VrApi events are produced: VRAPI_EVENT_NONE + ovrSuccess_EventUnavailable ends the app's polling loop.
+    if (event) event->EventType = 0;
+    return 1002;  // ovrSuccess_EventUnavailable
+}
+VRAPI void vrapi_RecenterPose(ovrMobile* mobile) {
+    // Deprecated in VrApi; OpenXR has no application recenter (the runtime's own recenter is reported via status 13).
+    (void)mobile;
+    OVP_LOG("vrapi_RecenterPose ignored");
+}
+VRAPI ovrResult vrapi_SetDisplayRefreshRate(ovrMobile* mobile, float rate) {
+    LOCK_STATE;
+    if (!validMobile(mobile)) return NotInitialized;
+    if (!s.requestDisplayRefreshRate || !s.session) return Unsupported;
+    return xrOk(s.requestDisplayRefreshRate(s.session, rate), "xrRequestDisplayRefreshRateFB") ? Success : InvalidParameter;
+}
+VRAPI int vrapi_GetSystemPropertyFloatArray(const ovrJava*, int property, float* values, int count) {
+    // The only array property is the supported refresh rates; its count property is 0 here, so report none.
+    (void)values;
+    OVP_LOG("Float array system property %d (%d values) unsupported", property, count);
+    return 0;
 }

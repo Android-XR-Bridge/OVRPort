@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "runtime.h"
 
+#include <EGL/egl.h>
+#include <GLES3/gl32.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -54,6 +57,13 @@ struct ovrTextureSwapChain {
     uint32_t outputImageCount = 0;
     std::array<XrSwapchainImageVulkanKHR, kMaxBuffers> outputImages{};
     std::array<bool, kMaxBuffers> outputInitialized{};
+
+    // GLES applications: the app renders into these textures; frames are copied to glOutputImages.
+    bool gl = false;
+    GLenum glInternalFormat = 0;
+    void* glContext = nullptr;  // EGL context current when the textures were created
+    std::array<GLuint, kMaxBuffers> glTextures{};
+    std::array<XrSwapchainImageOpenGLESKHR, kMaxBuffers> glOutputImages{};
 };
 
 namespace {
@@ -121,6 +131,11 @@ void destroyAppImage(AppImage& image) {
 }
 
 void destroyAppImages(ovrTextureSwapChain* chain) {
+    if (chain->gl) {
+        glDeleteTextures(static_cast<GLsizei>(chain->bufferCount), chain->glTextures.data());
+        chain->glTextures.fill(0);
+        return;
+    }
     for (uint32_t i = 0; i < chain->bufferCount; ++i) destroyAppImage(chain->appImages[i]);
     destroyAppImage(chain->fullRateImage);
     chain->fullRateInitialized = false;
@@ -313,10 +328,57 @@ bool ensureFullRateImage(ovrTextureSwapChain* chain) {
     return true;
 }
 
+bool ensureOutputGl(ovrTextureSwapChain* chain) {
+    ovp::Runtime& s = ovp::runtime();
+    uint32_t formatCount = 0;
+    std::array<int64_t, kMaxXrFormats> formats{};
+    if (XR_FAILED(s.xr.xrEnumerateSwapchainFormats(s.session, 0, &formatCount, nullptr)) || !formatCount ||
+        formatCount > kMaxXrFormats ||
+        XR_FAILED(s.xr.xrEnumerateSwapchainFormats(s.session, formatCount, &formatCount, formats.data()))) {
+        OVP_ERROR("xrEnumerateSwapchainFormats(GLES) failed");
+        return false;
+    }
+    auto exposed = [&](int64_t f) { return std::find(formats.begin(), formats.begin() + formatCount, f) != formats.begin() + formatCount; };
+    int64_t wanted = chain->glInternalFormat;
+    if (!exposed(wanted)) {
+        OVP_ERROR("OpenXR runtime does not expose GL format 0x%llx", (long long)wanted);
+        return false;
+    }
+    XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    create.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    create.format = wanted;
+    create.sampleCount = 1;
+    create.width = chain->width;
+    create.height = chain->height;
+    create.faceCount = 1;
+    create.arraySize = chain->arrayLayers;
+    create.mipCount = 1;
+    if (!ovp::xrOk(s.xr.xrCreateSwapchain(s.session, &create, &chain->output), "xrCreateSwapchain(GLES)")) {
+        chain->output = XR_NULL_HANDLE;
+        return false;
+    }
+    uint32_t count = 0;
+    if (XR_FAILED(s.xr.xrEnumerateSwapchainImages(chain->output, 0, &count, nullptr)) || !count || count > kMaxBuffers) {
+        destroyOutput(chain);
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) chain->glOutputImages[i] = {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
+    if (XR_FAILED(s.xr.xrEnumerateSwapchainImages(chain->output, count, &count,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(chain->glOutputImages.data())))) {
+        destroyOutput(chain);
+        return false;
+    }
+    chain->outputImageCount = count;
+    OVP_LOG("Created GLES output swapchain %ux%u x%u format 0x%llx", chain->width, chain->height,
+            chain->arrayLayers, (long long)wanted);
+    return true;
+}
+
 bool ensureOutput(ovrTextureSwapChain* chain) {
     if (chain->output != XR_NULL_HANDLE) return true;
     ovp::Runtime& s = ovp::runtime();
     if (s.session == XR_NULL_HANDLE) return false;
+    if (chain->gl) return ensureOutputGl(chain);
 
     uint32_t formatCount = 0;
     XrResult result = s.xr.xrEnumerateSwapchainFormats(s.session, 0, &formatCount, nullptr);
@@ -547,7 +609,34 @@ bool acquireJobs(std::array<CopyJob, kMaxCopyJobs>& jobs, uint32_t count) {
     return true;
 }
 
+bool submitCopiesGl(std::array<CopyJob, kMaxCopyJobs>& jobs, uint32_t count) {
+    ovp::Runtime& s = ovp::runtime();
+    if (count == 0) return true;
+    if (!acquireJobs(jobs, count)) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        ovrTextureSwapChain* chain = jobs[i].chain;
+        const GLuint source = chain->glTextures[jobs[i].sourceIndex];
+        const GLuint destination = chain->glOutputImages[jobs[i].outputIndex].image;
+        const GLenum target = chain->arrayLayers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+        while (glGetError() != GL_NO_ERROR) {}  // don't blame the copy for errors the app left behind
+        glCopyImageSubData(source, target, 0, 0, 0, 0, destination, target, 0, 0, 0, 0,
+                           static_cast<GLsizei>(chain->width), static_cast<GLsizei>(chain->height),
+                           static_cast<GLsizei>(chain->arrayLayers));
+        const GLenum error = glGetError();
+        static int errors;
+        if (error != GL_NO_ERROR && errors++ < 5) OVP_ERROR("glCopyImageSubData failed: 0x%x", error);
+    }
+    glFlush();
+    for (uint32_t i = 0; i < count; ++i) {
+        const XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        ovp::xrOk(s.xr.xrReleaseSwapchainImage(jobs[i].chain->output, &release), "xrReleaseSwapchainImage(GLES)");
+        jobs[i].acquired = false;
+    }
+    return true;
+}
+
 bool submitCopies(std::array<CopyJob, kMaxCopyJobs>& jobs, uint32_t count) {
+    if (ovp::runtime().gles) return submitCopiesGl(jobs, count);
     if (!settleCopy(kFrameWaitNs, false)) return false;
     reapRetired();
     if (count == 0) return true;
@@ -951,6 +1040,9 @@ VRAPI ovrResult vrapi_SubmitFrame2(ovrMobile* mobile,
                           rect.x, rect.y, rect.width, rect.height);
                 return failFrame(InvalidParameter);
             }
+            if (chain->gl) {  // GL images start at the bottom row: reverse the vertical tangent mapping
+                std::swap(output.views[eye].fov.angleUp, output.views[eye].fov.angleDown);
+            }
             output.views[eye].subImage.swapchain = chain->output;
             output.views[eye].subImage.imageArrayIndex =
                 chain->type == kTexture2DArray ? eye : 0;
@@ -1007,3 +1099,74 @@ void shutdown() {
     destroyCopyContext();
 }
 } // namespace ovp::graphics
+
+// ---------------------------------------------------------------- GLES texture swapchains
+namespace {
+constexpr int64_t kFormat8888 = 4, kFormat8888Srgb = 5, kFormatRgba16f = 6;
+}
+
+// format: VrApi's 32-bit ovrTextureFormat enum (only vrapi_CreateTextureSwapChain3 takes a 64-bit format)
+VRAPI ovrTextureSwapChain* vrapi_CreateTextureSwapChain2(int32_t type, int32_t format, int width, int height,
+                                                          int levels, int bufferCount) {
+    ovp::Runtime& s = ovp::runtime();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    GLenum internal = 0;
+    if (format == kFormat8888) internal = GL_RGBA8;
+    else if (format == kFormat8888Srgb) internal = GL_SRGB8_ALPHA8;
+    else if (format == kFormatRgba16f) internal = GL_RGBA16F;
+    if (!internal || (type != kTexture2D && type != kTexture2DArray) || width <= 0 || height <= 0 ||
+        width > 16384 || height > 16384 || levels <= 0 || bufferCount <= 0 ||
+        bufferCount > static_cast<int>(kMaxBuffers)) {
+        OVP_ERROR("Unsupported GLES texture swapchain type=%d format=%lld %dx%d levels=%d buffers=%d", type,
+                  (long long)format, width, height, levels, bufferCount);
+        return nullptr;
+    }
+    ovrTextureSwapChain* chain = new (std::nothrow) ovrTextureSwapChain();
+    if (!chain) return nullptr;
+    chain->gl = true;
+    chain->glInternalFormat = internal;
+    chain->glContext = eglGetCurrentContext();
+    chain->type = type;
+    chain->width = static_cast<uint32_t>(width);
+    chain->height = static_cast<uint32_t>(height);
+    chain->levels = 1;
+    chain->bufferCount = static_cast<uint32_t>(bufferCount);
+    chain->arrayLayers = type == kTexture2DArray ? 2u : 1u;
+    const GLenum target = chain->arrayLayers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    glGenTextures(static_cast<GLsizei>(chain->bufferCount), chain->glTextures.data());
+    for (uint32_t i = 0; i < chain->bufferCount; ++i) {
+        glBindTexture(target, chain->glTextures[i]);
+        if (target == GL_TEXTURE_2D_ARRAY) glTexStorage3D(target, 1, internal, width, height, 2);
+        else glTexStorage2D(target, 1, internal, width, height);
+        glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(target, 0);
+    const GLenum error = glGetError();
+    if (error != GL_NO_ERROR) {
+        OVP_ERROR("GLES texture swapchain creation failed: 0x%x (is a GL context current?)", error);
+        destroyChain(chain);
+        return nullptr;
+    }
+    chain->next = gChains;
+    gChains = chain;
+    OVP_LOG("Created GLES texture swapchain %dx%d x%u buffers=%d format=0x%x ctx=%p names=%u..%u", width, height,
+            chain->arrayLayers, bufferCount, internal, chain->glContext, chain->glTextures[0],
+            chain->glTextures[chain->bufferCount - 1]);
+    return chain;
+}
+
+VRAPI ovrTextureSwapChain* vrapi_CreateTextureSwapChain(int32_t type, int32_t format, int width, int height,
+                                                         int levels, bool buffered) {
+    return vrapi_CreateTextureSwapChain2(type, format, width, height, levels, buffered ? 3 : 1);
+}
+
+VRAPI unsigned int vrapi_GetTextureSwapChainHandle(ovrTextureSwapChain* candidate, int index) {
+    ovp::Runtime& s = ovp::runtime();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    ovrTextureSwapChain* chain = findChain(candidate);
+    if (!chain || !chain->gl || index < 0 || index >= static_cast<int>(chain->bufferCount)) return 0;
+    return chain->glTextures[static_cast<uint32_t>(index)];
+}
