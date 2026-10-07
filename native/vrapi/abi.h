@@ -62,6 +62,17 @@ struct ovrLayerProjection2 {
         ovrRectf TextureRect;
     } Textures[2];
 };
+struct ovrLayerCylinder2 {
+    ovrLayerHeader2 Header;
+    ovrRigidBodyPosef HeadPose;
+    struct {
+        ovrTextureSwapChain* ColorSwapChain;
+        int32_t SwapChainIndex;
+        ovrMatrix4f TexCoordsFromTanAngles;
+        ovrRectf TextureRect;
+        ovrMatrix4f TextureMatrix;
+    } Textures[2];
+};
 struct ovrSubmitFrameDescription2 {
     uint32_t Flags, SwapInterval;
     uint64_t FrameIndex;
@@ -77,3 +88,4 @@ static_assert(sizeof(ovrRigidBodyPosef) == 96 && sizeof(ovrTracking2) == 360);
 static_assert(sizeof(ovrTracking) == 104 && sizeof(ovrLayerHeader2) == 40);
 static_assert(sizeof(ovrLayerProjection2) == 328 && sizeof(ovrSubmitFrameDescription2) == 48);
 static_assert(offsetof(ovrLayerProjection2, Textures) == 136);
+static_assert(sizeof(ovrLayerCylinder2) == 456 && offsetof(ovrLayerCylinder2, Textures) == 136);

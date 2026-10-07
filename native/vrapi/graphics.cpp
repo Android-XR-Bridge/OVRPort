@@ -485,8 +485,104 @@ bool projectionGeometry(const ovrMatrix4f& matrix, const ovrRectf& rect,
     return true;
 }
 
+// VrApi cylinder -> flat OpenXR quad (the Frame runtime lacks XR_KHR_composition_layer_cylinder).
+// TexCoordsFromTanAngles is the inverse of the cylinder's eye-space model-view matrix; the unit
+// cylinder spans 180 degrees of u, so the central angle is pi / TextureMatrix.M[0][0].
+bool invert4(const ovrMatrix4f& in, double out[4][4]) {
+    double a[4][8];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 8; ++c) a[r][c] = c < 4 ? in.M[r][c] : (c - 4 == r ? 1.0 : 0.0);
+    for (int c = 0; c < 4; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; ++r)
+            if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
+        if (std::fabs(a[pivot][c]) < 1e-12) return false;
+        if (pivot != c)
+            for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[pivot][k]);
+        const double d = a[c][c];
+        for (int k = 0; k < 8; ++k) a[c][k] /= d;
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) continue;
+            const double f = a[r][c];
+            for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) out[r][c] = a[r][c + 4];
+    return true;
+}
+
+XrQuaternionf quatFromBasis(const double m[3][3]) {
+    XrQuaternionf q{};
+    const double trace = m[0][0] + m[1][1] + m[2][2];
+    if (trace > 0) {
+        const double s = std::sqrt(trace + 1.0) * 2;
+        q.w = static_cast<float>(0.25 * s);
+        q.x = static_cast<float>((m[2][1] - m[1][2]) / s);
+        q.y = static_cast<float>((m[0][2] - m[2][0]) / s);
+        q.z = static_cast<float>((m[1][0] - m[0][1]) / s);
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const double s = std::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2;
+        q.w = static_cast<float>((m[2][1] - m[1][2]) / s);
+        q.x = static_cast<float>(0.25 * s);
+        q.y = static_cast<float>((m[0][1] + m[1][0]) / s);
+        q.z = static_cast<float>((m[0][2] + m[2][0]) / s);
+    } else if (m[1][1] > m[2][2]) {
+        const double s = std::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2;
+        q.w = static_cast<float>((m[0][2] - m[2][0]) / s);
+        q.x = static_cast<float>((m[0][1] + m[1][0]) / s);
+        q.y = static_cast<float>(0.25 * s);
+        q.z = static_cast<float>((m[1][2] + m[2][1]) / s);
+    } else {
+        const double s = std::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2;
+        q.w = static_cast<float>((m[1][0] - m[0][1]) / s);
+        q.x = static_cast<float>((m[0][2] + m[2][0]) / s);
+        q.y = static_cast<float>((m[1][2] + m[2][1]) / s);
+        q.z = static_cast<float>(0.25 * s);
+    }
+    return normalize(q);
+}
+
+// Eye-space pose and size of a flat quad approximating the cylinder seen by `eye`.
+bool cylinderAsQuad(const ovrLayerCylinder2& layer, uint32_t eye, uint32_t texWidth, uint32_t texHeight,
+                    XrPosef& local, XrExtent2Df& size) {
+    const auto& t = layer.Textures[eye];
+    double mv[4][4];
+    if (!invert4(t.TexCoordsFromTanAngles, mv)) return false;
+    double basis[3][3], len[3];
+    for (int c = 0; c < 3; ++c) {
+        len[c] = std::sqrt(mv[0][c] * mv[0][c] + mv[1][c] * mv[1][c] + mv[2][c] * mv[2][c]);
+        if (!(len[c] > 1e-6)) return false;
+        for (int r = 0; r < 3; ++r) basis[r][c] = mv[r][c] / len[c];
+    }
+    const double radius = len[0];
+    const float uScale = t.TextureMatrix.M[0][0];
+    double angle = uScale > 0.01f ? M_PI / uScale : M_PI / 2;
+    if (angle > 2 * M_PI) angle = 2 * M_PI;
+    const float rw = t.TextureRect.width > 0 ? t.TextureRect.width : 1.0f;
+    const float rh = t.TextureRect.height > 0 ? t.TextureRect.height : 1.0f;
+    size.width = static_cast<float>(radius * angle);
+    size.height = size.width * (static_cast<float>(texHeight) * rh) / (static_cast<float>(texWidth) * rw);
+    local.orientation = quatFromBasis(basis);
+    const XrVector3f forward = rotate(local.orientation, {0, 0, static_cast<float>(-radius)});
+    local.position = {static_cast<float>(mv[0][3]) + forward.x, static_cast<float>(mv[1][3]) + forward.y,
+                      static_cast<float>(mv[2][3]) + forward.z};
+    return finite(size.width) && finite(size.height) && size.width > 0 && size.height > 0 &&
+           finite(local.position.x) && finite(local.position.y) && finite(local.position.z);
+}
+
+XrPosef composePose(const XrPosef& a, const XrPosef& b) {
+    XrPosef r;
+    r.orientation = normalize(multiply(a.orientation, b.orientation));
+    const XrVector3f p = rotate(a.orientation, b.position);
+    r.position = {a.position.x + p.x, a.position.y + p.y, a.position.z + p.z};
+    return r;
+}
+
 struct PreparedLayer {
     const ovrLayerProjection2* source = nullptr;
+    const ovrLayerCylinder2* cylinder = nullptr;
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     bool black = false;
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     std::array<XrCompositionLayerProjectionView, 2> views{{
@@ -826,6 +922,28 @@ VRAPI ovrResult vrapi_SubmitFrame2(ovrMobile* mobile,
     for (uint32_t i = 0; i < description->LayerCount; ++i) {
         const ovrLayerHeader2* header = description->Layers[i];
         if (!header) return failFrame(InvalidParameter);
+        if (header->Type == 6) {  // VRAPI_LAYER_TYPE_LOADING_ICON2: nothing to show on OpenXR
+            prepared[i].black = true;
+            continue;
+        }
+        if (header->Type == 3) {  // VRAPI_LAYER_TYPE_CYLINDER2 -> flat quad
+            const auto* cylinder = reinterpret_cast<const ovrLayerCylinder2*>(header);
+            ovrTextureSwapChain* chain = findChain(cylinder->Textures[0].ColorSwapChain);
+            const int index = cylinder->Textures[0].SwapChainIndex;
+            if (!chain || index < 0 || index >= static_cast<int>(chain->bufferCount) ||
+                header->ColorScale.w <= 0.0f) {
+                prepared[i].black = true;
+                continue;
+            }
+            prepared[i].cylinder = cylinder;
+            if (header->SrcBlend == kBlendOne && header->DstBlend == kBlendZero) prepared[i].quad.layerFlags = 0;
+            else if (header->SrcBlend == kBlendOne && header->DstBlend == kBlendOneMinusSrcAlpha)
+                prepared[i].quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            else
+                prepared[i].quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                              XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            continue;
+        }
         if (header->Type != kProjectionLayer) {
             OVP_ERROR("Unsupported VrApi layer type %d", header->Type);
             return failFrame(Unsupported);
@@ -910,6 +1028,56 @@ VRAPI ovrResult vrapi_SubmitFrame2(ovrMobile* mobile,
     for (uint32_t i = 0; i < description->LayerCount; ++i) {
         PreparedLayer& output = prepared[i];
         if (output.black) continue;
+        if (output.cylinder) {
+            const auto& tex = output.cylinder->Textures[0];
+            ovrTextureSwapChain* chain = findChain(tex.ColorSwapChain);
+            if (!chain || !ensureOutput(chain)) return failFrame(DeviceUnavailable);
+            XrPosef local;
+            XrExtent2Df size;
+            if (!cylinderAsQuad(*output.cylinder, 0, chain->width, chain->height, local, size)) {
+                static int bad;
+                if (bad++ < 5) OVP_ERROR("Cylinder layer has an invalid transform; skipped");
+                continue;
+            }
+            const bool cylHeadLocked = (output.cylinder->Header.Flags & kLayerFixedToView) != 0;
+            XrPosef eye0;
+            if (cylHeadLocked) {
+                output.quad.space = s.viewSpace;
+                output.quad.pose = local;
+            } else if (eyePose(output.cylinder->HeadPose.Pose, 0, eye0)) {
+                output.quad.space = s.appSpace;
+                output.quad.pose = composePose(eye0, local);
+            } else {
+                continue;
+            }
+            static int logged;
+            if (logged++ < 3)
+                OVP_LOG("Cylinder->quad: tex %ux%u uScale=%g size=%.2fx%.2f m local pos=(%.2f,%.2f,%.2f) headLocked=%d",
+                        chain->width, chain->height, tex.TextureMatrix.M[0][0], size.width, size.height,
+                        local.position.x, local.position.y, local.position.z, cylHeadLocked);
+            output.quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            output.quad.size = size;
+            output.quad.subImage.swapchain = chain->output;
+            output.quad.subImage.imageArrayIndex = 0;
+            const float rx = tex.TextureRect.width > 0 ? tex.TextureRect.x : 0.0f;
+            const float ry = tex.TextureRect.height > 0 ? tex.TextureRect.y : 0.0f;
+            const float rw = tex.TextureRect.width > 0 ? tex.TextureRect.width : 1.0f;
+            const float rh = tex.TextureRect.height > 0 ? tex.TextureRect.height : 1.0f;
+            output.quad.subImage.imageRect.offset = {static_cast<int32_t>(rx * chain->width),
+                                                     static_cast<int32_t>(ry * chain->height)};
+            output.quad.subImage.imageRect.extent = {std::max(1, static_cast<int32_t>(rw * chain->width)),
+                                                     std::max(1, static_cast<int32_t>(rh * chain->height))};
+            uint32_t job = 0;
+            for (; job < jobCount && jobs[job].chain != chain; ++job) {}
+            if (job == jobCount) {
+                if (jobCount == kMaxCopyJobs) return failFrame(Unsupported);
+                jobs[jobCount].chain = chain;
+                jobs[jobCount].sourceIndex = static_cast<uint32_t>(tex.SwapChainIndex);
+                ++jobCount;
+            }
+            xrLayers[xrLayerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&output.quad);
+            continue;
+        }
         const bool headLocked = (output.source->Header.Flags & kLayerFixedToView) != 0;
         if (headLocked && !haveHeadLockedViews) {
             XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
