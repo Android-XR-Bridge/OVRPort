@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "abi.h"
+#include <EGL/egl.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <android/log.h>
@@ -61,6 +62,12 @@ struct Runtime {
     std::array<float, 2> locatedFovDegrees{};
     std::array<XrView, 2> views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
     ovrSystemCreateInfoVulkan vk{};
+    // GLES apps (no vrapi_CreateSystemVulkan): EGL objects from ovrModeParms.
+    bool gles = false, glesExtension = false, vulkanExtension = false;
+    EGLDisplay eglDisplay = EGL_NO_DISPLAY;
+    EGLContext eglContext = EGL_NO_CONTEXT;
+    EGLConfig eglConfig = nullptr;
+    PFN_xrGetOpenGLESGraphicsRequirementsKHR getGlesRequirements = nullptr;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     double timeOffset = 0;
@@ -73,6 +80,7 @@ struct Runtime {
     PFN_xrSetAndroidApplicationThreadKHR setThread = nullptr;
     PFN_axrbGetSystemDisplayRefreshRate getSystemDisplayRefreshRate = nullptr;
     PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB requestDisplayRefreshRate = nullptr;
     DisplayRefreshRateSource loggedDisplayRefreshRateSource = DisplayRefreshRateSource::Unqueried;
     float loggedDisplayRefreshRate = 0;
     ovrPosef trackingTransform{{0, 0, 0, 1}, {0, 0, 0}};

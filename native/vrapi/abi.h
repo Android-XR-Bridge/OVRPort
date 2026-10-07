@@ -11,6 +11,7 @@
 using ovrResult = int32_t;
 constexpr ovrResult Success = 0, NotInitialized = -1004, InvalidParameter = -1005,
     DeviceUnavailable = -1010, InvalidOperation = -1015, Unsupported = -1050, NoDevice = -1051;
+struct ovrEventHeader { int32_t EventType; };  // VrApi_Types.h: followed by event-specific data
 struct ovrJava { JavaVM* Vm; JNIEnv* Env; jobject ActivityObject; };
 struct ovrVector2f { float x, y; };
 struct ovrVector3f { float x, y, z; };
