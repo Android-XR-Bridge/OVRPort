@@ -331,12 +331,29 @@ bool ensureOutput(ovrTextureSwapChain* chain) {
         ovp::xrOk(result, "xrEnumerateSwapchainFormats");
         return false;
     }
-    const int64_t wanted = static_cast<int64_t>(chain->format);
-    if (std::find(formats.begin(), formats.begin() + formatCount, wanted) ==
-        formats.begin() + formatCount) {
-        OVP_ERROR("OpenXR runtime does not expose requested VkFormat %lld",
-                  static_cast<long long>(wanted));
-        return false;
+    int64_t wanted = static_cast<int64_t>(chain->format);
+    auto exposed = [&](int64_t f) {
+        return std::find(formats.begin(), formats.begin() + formatCount, f) != formats.begin() + formatCount;
+    };
+    if (!exposed(wanted)) {
+        // Steam Frame exposes only the sRGB variants. The output is filled with vkCmdCopyImage, a raw
+        // copy that is valid between size-compatible UNORM/SRGB twins, so use the twin instead.
+        int64_t twin = 0;
+        switch (wanted) {
+            case VK_FORMAT_R8G8B8A8_UNORM: twin = VK_FORMAT_R8G8B8A8_SRGB; break;
+            case VK_FORMAT_R8G8B8A8_SRGB: twin = VK_FORMAT_R8G8B8A8_UNORM; break;
+            case VK_FORMAT_B8G8R8A8_UNORM: twin = VK_FORMAT_B8G8R8A8_SRGB; break;
+            case VK_FORMAT_B8G8R8A8_SRGB: twin = VK_FORMAT_B8G8R8A8_UNORM; break;
+            default: break;
+        }
+        if (!twin || !exposed(twin)) {
+            OVP_ERROR("OpenXR runtime does not expose requested VkFormat %lld",
+                      static_cast<long long>(wanted));
+            return false;
+        }
+        OVP_LOG("Runtime lacks VkFormat %lld; using size-compatible VkFormat %lld for the output swapchain",
+                static_cast<long long>(wanted), static_cast<long long>(twin));
+        wanted = twin;
     }
 
     XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
