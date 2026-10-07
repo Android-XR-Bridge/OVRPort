@@ -246,12 +246,12 @@ bool beginFrame(int64_t index) {
         // OpenXR LOCAL need not be eye-level. Establish VrApi's initial yaw/position
         // origin from a tracked, visible head before exposing it to the application.
         XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
-        constexpr XrSpaceLocationFlags tracked =
-            XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
-            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-        if ((s.sessionState != XR_SESSION_STATE_VISIBLE && s.sessionState != XR_SESSION_STATE_FOCUSED) ||
-            !xrOk(s.xr.xrLocateSpace(s.viewSpace, s.localSpace, s.frame.predictedDisplayTime, &head), "initial eye-level origin") ||
-            (head.locationFlags & tracked) != tracked) {
+        // Steam Frame reports poses as VALID without the TRACKED bits here, so only validity is required.
+        constexpr XrSpaceLocationFlags tracked = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+        const bool visible = s.sessionState == XR_SESSION_STATE_VISIBLE || s.sessionState == XR_SESSION_STATE_FOCUSED;
+        const bool located = visible &&
+            xrOk(s.xr.xrLocateSpace(s.viewSpace, s.localSpace, s.frame.predictedDisplayTime, &head), "initial eye-level origin");
+        if (!located || (head.locationFlags & tracked) != tracked) {
             endFrame(nullptr, 0);
             return false;
         }
@@ -522,14 +522,14 @@ VRAPI ovrMobile* vrapi_EnterVrMode(const ovrModeParms* parms) {
     const auto* vk = reinterpret_cast<const ovrModeParmsVulkan*>(parms);
     if (!ensureSession(reinterpret_cast<VkQueue>(vk->SynchronizationQueue))) return nullptr;
     // Runtime READY can arrive asynchronously. Wait only for a bounded lifecycle transition.
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);  // Frame: session reaches FOCUSED and first tracked pose later than Quest
     while (!s.running) {
-        if (!pollEvents() || std::chrono::steady_clock::now() >= deadline) { destroySession(); return nullptr; }
+        if (!pollEvents() || std::chrono::steady_clock::now() >= deadline) { OVP_LOG("EnterVrMode: session never started running"); destroySession(); return nullptr; }
         if (!s.running) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     while (s.initialRecenterPending) {
         if (beginFrame(s.frameIndex + 1)) break;
-        if (std::chrono::steady_clock::now() >= deadline) { destroySession(); return nullptr; }
+        if (std::chrono::steady_clock::now() >= deadline) { OVP_LOG("EnterVrMode: no tracked head pose before deadline"); destroySession(); return nullptr; }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ++s.mobile.generation;

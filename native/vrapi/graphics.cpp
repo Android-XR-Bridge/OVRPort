@@ -826,6 +826,10 @@ VRAPI ovrResult vrapi_SubmitFrame2(ovrMobile* mobile,
     for (uint32_t i = 0; i < description->LayerCount; ++i) {
         const ovrLayerHeader2* header = description->Layers[i];
         if (!header) return failFrame(InvalidParameter);
+        if (header->Type == 6) {  // VRAPI_LAYER_TYPE_LOADING_ICON2: nothing to show on OpenXR
+            prepared[i].black = true;
+            continue;
+        }
         if (header->Type != kProjectionLayer) {
             OVP_ERROR("Unsupported VrApi layer type %d", header->Type);
             return failFrame(Unsupported);
