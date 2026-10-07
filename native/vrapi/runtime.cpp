@@ -482,6 +482,7 @@ VRAPI int vrapi_Initialize(const ovrInitParms* parms) {
     if (s.threadExtension) load("xrSetAndroidApplicationThreadKHR", reinterpret_cast<PFN_xrVoidFunction*>(&s.setThread));
     if (s.systemDisplayRefreshRateExtension) load("xrGetSystemDisplayRefreshRateAXRB", reinterpret_cast<PFN_xrVoidFunction*>(&s.getSystemDisplayRefreshRate));
     if (s.displayRefreshRateExtension) load("xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&s.getDisplayRefreshRate));
+    if (s.displayRefreshRateExtension) load("xrRequestDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&s.requestDisplayRefreshRate));
     OVP_LOG("Initialized Vulkan/OpenXR adapter, stereo=%ux%u", s.viewConfig[0].recommendedImageRectWidth, s.viewConfig[0].recommendedImageRectHeight);
     return 0;
 }
@@ -664,4 +665,42 @@ VRAPI ovrResult vrapi_SetClientColorDesc(ovrMobile* mobile, const ovrHmdColorDes
     if (!color) return InvalidParameter;
     if (!s.setColorSpace) return color->ColorSpace == 0 ? Success : Unsupported;
     return xrOk(s.setColorSpace(s.session, static_cast<XrColorSpaceFB>(color->ColorSpace)), "xrSetColorSpaceFB") ? Success : InvalidParameter;
+}
+
+VRAPI ovrResult vrapi_SetTrackingSpace(ovrMobile* mobile, int32_t space) {
+    // Tracking-space changes (eye/floor level) are handled by the app's own poses; accept and ignore. VrApi returns an
+    // ovrResult here: a void function left the caller reading whatever was in w0.
+    (void)mobile;
+    OVP_LOG("vrapi_SetTrackingSpace(%d) ignored", space);
+    return Success;
+}
+VRAPI bool vrapi_ShowSystemUI(const ovrJava* java, int32_t type) {
+    (void)java;
+    OVP_LOG("vrapi_ShowSystemUI(%d) unsupported", type);
+    return false;
+}
+
+// Functions some engines import even when they never rely on them (e.g. BlazeRush's libtargemapp.so): a missing one
+// stops the game from loading at all ("cannot locate symbol").
+VRAPI ovrResult vrapi_PollEvent(ovrEventHeader* event) {
+    // No VrApi events are produced: VRAPI_EVENT_NONE + ovrSuccess_EventUnavailable ends the app's polling loop.
+    if (event) event->EventType = 0;
+    return 1002;  // ovrSuccess_EventUnavailable
+}
+VRAPI void vrapi_RecenterPose(ovrMobile* mobile) {
+    // Deprecated in VrApi; OpenXR has no application recenter (the runtime's own recenter is reported via status 13).
+    (void)mobile;
+    OVP_LOG("vrapi_RecenterPose ignored");
+}
+VRAPI ovrResult vrapi_SetDisplayRefreshRate(ovrMobile* mobile, float rate) {
+    LOCK_STATE;
+    if (!validMobile(mobile)) return NotInitialized;
+    if (!s.requestDisplayRefreshRate || !s.session) return Unsupported;
+    return xrOk(s.requestDisplayRefreshRate(s.session, rate), "xrRequestDisplayRefreshRateFB") ? Success : InvalidParameter;
+}
+VRAPI int vrapi_GetSystemPropertyFloatArray(const ovrJava*, int property, float* values, int count) {
+    // The only array property is the supported refresh rates; its count property is 0 here, so report none.
+    (void)values;
+    OVP_LOG("Float array system property %d (%d values) unsupported", property, count);
+    return 0;
 }

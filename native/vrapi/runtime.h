@@ -73,6 +73,7 @@ struct Runtime {
     PFN_xrSetAndroidApplicationThreadKHR setThread = nullptr;
     PFN_axrbGetSystemDisplayRefreshRate getSystemDisplayRefreshRate = nullptr;
     PFN_xrGetDisplayRefreshRateFB getDisplayRefreshRate = nullptr;
+    PFN_xrRequestDisplayRefreshRateFB requestDisplayRefreshRate = nullptr;
     DisplayRefreshRateSource loggedDisplayRefreshRateSource = DisplayRefreshRateSource::Unqueried;
     float loggedDisplayRefreshRate = 0;
     ovrPosef trackingTransform{{0, 0, 0, 1}, {0, 0, 0}};
